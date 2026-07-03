@@ -109,8 +109,8 @@ DATA_ROOT="/srv/data"
 # Subdirectories expected under DATA_ROOT
 DATA_DIRS="media downloads documents photos backups"
 
-# Service names for URL generation (vmid:name, replace spaces with underscores)
-SERVICE_NAMES="100:Plex 101:Homer 102:Download_Gateway 103:NextExplorer"
+# Service names for URL generation (vmid:name, replace spaces with underscores, or comma-separated for multiple users)
+SERVICE_NAMES="100:Plex 101:Homer 102:gateway,aria2 103:NextExplorer"
 
 # Service port mappings (vmid:port)
 SERVICE_PORTS="100:32400 101:8010 102:8080 103:3000"

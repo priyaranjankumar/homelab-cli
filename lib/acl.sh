@@ -67,25 +67,49 @@ _acl_get_uid_offset() {
     echo "${offset:-100000}"
 }
 
-# _acl_detect_service_user <vmid> <config>
-#   Detect the primary service user inside the container by checking:
-#   1. A user matching the service name configured in homelab.conf
+# _acl_detect_service_users <vmid> <config>
+#   Detect the primary service users inside the container by checking:
+#   1. Users matching the service names configured in homelab.conf (supports comma-separated list)
 #   2. A user matching the container hostname
 #   3. Standard UID 1000 user
-#   Returns "username:uid" or "unknown:1000".
-_acl_detect_service_user() {
+#   Returns a space-separated list of "username:uid" pairs.
+_acl_detect_service_users() {
     local vmid="$1"
     local config="$2"
 
     local hostname
     hostname="$(_acl_get_hostname "$config")"
 
-    # Try lookup from SERVICE_NAMES in config
-    local svc_name=""
+    # Get service names list (comma-separated, convert to list)
+    local svc_names_str=""
     if [[ -n "${SERVICE_NAMES:-}" ]]; then
-        svc_name="$(map_lookup "${SERVICE_NAMES}" "$vmid" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
-        # Replace underscores back to hyphens if any
-        svc_name="${svc_name//_/-}"
+        svc_names_str="$(map_lookup "${SERVICE_NAMES}" "$vmid" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+        svc_names_str="${svc_names_str//_/-}"
+    fi
+
+    # Split by comma
+    local -a search_users=()
+    if [[ -n "$svc_names_str" ]]; then
+        IFS=',' read -r -a parsed_names <<< "$svc_names_str"
+        for name in "${parsed_names[@]}"; do
+            search_users+=("$name")
+        done
+    fi
+
+    # Add hostname (lowercased) if not already in search_users
+    if [[ -n "$hostname" ]]; then
+        local hn_lower
+        hn_lower="$(echo "$hostname" | tr 'A-Z' 'a-z')"
+        local found_hn=false
+        for u in "${search_users[@]}"; do
+            if [[ "$u" == "$hn_lower" ]]; then
+                found_hn=true
+                break
+            fi
+        done
+        if [[ "$found_hn" == "false" ]]; then
+            search_users+=("$hn_lower")
+        fi
     fi
 
     # Read passwd contents (via pct exec if running, otherwise host rootfs)
@@ -114,33 +138,32 @@ _acl_detect_service_user() {
         done
     fi
 
+    local -a matched_users=()
     if [[ "$read_success" == "true" ]]; then
-        local user_line=""
-        
-        # 1. Try matching service name
-        if [[ -n "$svc_name" ]]; then
-            user_line="$(echo "$passwd_content" | awk -F: -v u="$svc_name" '$1 == u { print $1":"$3; exit }' 2>/dev/null || true)"
-        fi
-        
-        # 2. Try matching hostname (lowercased)
-        if [[ -z "$user_line" && -n "$hostname" ]]; then
-            local hn_lower
-            hn_lower="$(echo "$hostname" | tr 'A-Z' 'a-z')"
-            user_line="$(echo "$passwd_content" | awk -F: -v u="$hn_lower" '$1 == u { print $1":"$3; exit }' 2>/dev/null || true)"
-        fi
-        
-        # 3. Try fallback standard UID 1000
-        if [[ -z "$user_line" ]]; then
-            user_line="$(echo "$passwd_content" | awk -F: '$3 == 1000 { print $1":"$3; exit }' 2>/dev/null || true)"
-        fi
-        
-        if [[ -n "$user_line" ]]; then
-            echo "$user_line"
-            return 0
+        for u in "${search_users[@]}"; do
+            local line
+            line="$(echo "$passwd_content" | awk -F: -v username="$u" '$1 == username { print $1":"$3; exit }' 2>/dev/null || true)"
+            if [[ -n "$line" ]]; then
+                matched_users+=("$line")
+            fi
+        done
+
+        # If no users matched, fall back to UID 1000
+        if [[ ${#matched_users[@]} -eq 0 ]]; then
+            local line
+            line="$(echo "$passwd_content" | awk -F: '$3 == 1000 { print $1":"$3; exit }' 2>/dev/null || true)"
+            if [[ -n "$line" ]]; then
+                matched_users+=("$line")
+            fi
         fi
     fi
 
-    echo "unknown:1000"
+    # Final fallback if absolutely nothing works
+    if [[ ${#matched_users[@]} -eq 0 ]]; then
+        matched_users+=("unknown:1000")
+    fi
+
+    echo "${matched_users[*]}"
 }
 
 # _acl_parse_bind_mounts <config>
@@ -246,11 +269,9 @@ _acl_inspect_data() {
         uid_offset="$(_acl_get_uid_offset "$config")"
     fi
 
-    # Detect service user
-    local service_info
-    service_info="$(_acl_detect_service_user "$vmid" "$config")"
-    local service_user="${service_info%%:*}"
-    local service_uid="${service_info##*:}"
+    # Detect service users
+    local service_users_list
+    service_users_list="$(_acl_detect_service_users "$vmid" "$config")"
 
     _ACL_RESULTS=()
 
@@ -258,68 +279,73 @@ _acl_inspect_data() {
     local json_items=""
 
     while IFS='|' read -r host_path container_path; do
-        local mapped_uid=$(( service_uid + uid_offset ))
         local owner
         owner="$(_acl_get_owner "$host_path")"
-        local access
-        access="$(_acl_check_access "$host_path" "$mapped_uid")"
 
-        # Determine recommendation
-        local recommendation="OK"
-        if [[ "$access" == "path_missing" ]]; then
-            recommendation="Path does not exist on host"
-            access="N/A"
-        elif [[ "$access" == "None" ]]; then
-            recommendation="Grant RWX"
-        elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null; then
-            # Has some access but may be insufficient — check for at least rw
-            if [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
-                recommendation="Grant RWX (insufficient)"
+        for service_info in ${service_users_list}; do
+            local service_user="${service_info%%:*}"
+            local service_uid="${service_info##*:}"
+            local mapped_uid=$(( service_uid + uid_offset ))
+            local access
+            access="$(_acl_check_access "$host_path" "$mapped_uid")"
+
+            # Determine recommendation
+            local recommendation="OK"
+            if [[ "$access" == "path_missing" ]]; then
+                recommendation="Path does not exist on host"
+                access="N/A"
+            elif [[ "$access" == "None" ]]; then
+                recommendation="Grant RWX"
+            elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null; then
+                # Has some access but may be insufficient — check for at least rw
+                if [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
+                    recommendation="Grant RWX (insufficient)"
+                fi
             fi
-        fi
 
-        # Store result for grant reuse
-        _ACL_RESULTS+=("${host_path}|${container_path}|${owner}|${service_user}|${service_uid}|${mapped_uid}|${access}|${recommendation}")
+            # Store result for grant reuse
+            _ACL_RESULTS+=("${host_path}|${container_path}|${owner}|${service_user}|${service_uid}|${mapped_uid}|${access}|${recommendation}")
 
-        if [[ "${HOMELAB_JSON}" == "true" ]]; then
-            # Build JSON item
-            local item_buf
-            local _OUTER_JSON_BUF="$_JSON_BUF"
-            local _OUTER_JSON_FIRST="$_JSON_FIRST"
-            json_start
-            json_add_string "host_path" "$host_path"
-            json_add_string "container_path" "$container_path"
-            json_add_string "filesystem_owner" "$owner"
-            json_add_string "service_user" "$service_user"
-            json_add_number "service_uid" "$service_uid"
-            json_add_number "mapped_host_uid" "$mapped_uid"
-            json_add_bool "unprivileged" "$is_unprivileged"
-            json_add_number "uid_offset" "$uid_offset"
-            json_add_string "current_access" "$access"
-            json_add_string "recommendation" "$recommendation"
-            item_buf="$(_JSON_BUF="$_JSON_BUF" json_end)"
-            _JSON_BUF="$_OUTER_JSON_BUF"
-            _JSON_FIRST="$_OUTER_JSON_FIRST"
+            if [[ "${HOMELAB_JSON}" == "true" ]]; then
+                # Build JSON item
+                local item_buf
+                local _OUTER_JSON_BUF="$_JSON_BUF"
+                local _OUTER_JSON_FIRST="$_JSON_FIRST"
+                json_start
+                json_add_string "host_path" "$host_path"
+                json_add_string "container_path" "$container_path"
+                json_add_string "filesystem_owner" "$owner"
+                json_add_string "service_user" "$service_user"
+                json_add_number "service_uid" "$service_uid"
+                json_add_number "mapped_host_uid" "$mapped_uid"
+                json_add_bool "unprivileged" "$is_unprivileged"
+                json_add_number "uid_offset" "$uid_offset"
+                json_add_string "current_access" "$access"
+                json_add_string "recommendation" "$recommendation"
+                item_buf="$(_JSON_BUF="$_JSON_BUF" json_end)"
+                _JSON_BUF="$_OUTER_JSON_BUF"
+                _JSON_FIRST="$_OUTER_JSON_FIRST"
 
-            if [[ -n "$json_items" ]]; then
-                json_items+=","
-            fi
-            json_items+="$item_buf"
-        else
-            print_separator
-            printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Container:" "$vmid"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Hostname:" "$hostname"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s → %s\n" "Bind Mount:" "$host_path" "$container_path"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Filesystem Owner:" "$owner"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s (UID %s)\n" "Service User:" "$service_user" "$service_uid"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Mapped Host UID:" "$mapped_uid"
-            printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Current Access:" "$access"
-            if [[ "$recommendation" == "OK" ]]; then
-                printf "  ${C_BOLD}%-20s${C_RESET} ${C_GREEN}%s${C_RESET}\n" "Recommendation:" "$recommendation"
+                if [[ -n "$json_items" ]]; then
+                    json_items+=","
+                fi
+                json_items+="$item_buf"
             else
-                printf "  ${C_BOLD}%-20s${C_RESET} ${C_YELLOW}%s${C_RESET}\n" "Recommendation:" "$recommendation"
+                print_separator
+                printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Container:" "$vmid"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Hostname:" "$hostname"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s → %s\n" "Bind Mount:" "$host_path" "$container_path"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Filesystem Owner:" "$owner"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s (UID %s)\n" "Service User:" "$service_user" "$service_uid"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Mapped Host UID:" "$mapped_uid"
+                printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Current Access:" "$access"
+                if [[ "$recommendation" == "OK" ]]; then
+                    printf "  ${C_BOLD}%-20s${C_RESET} ${C_GREEN}%s${C_RESET}\n" "Recommendation:" "$recommendation"
+                else
+                    printf "  ${C_BOLD}%-20s${C_RESET} ${C_YELLOW}%s${C_RESET}\n" "Recommendation:" "$recommendation"
+                fi
             fi
-        fi
+        done
     done <<< "$mounts"
 
     if [[ "${HOMELAB_JSON}" == "true" ]]; then
