@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# homelab — Proxmox VE homelab management CLI
+# Entry point: parses global flags, dispatches subcommands.
+
+set -euo pipefail
+
+# ─── Resolve installation root ───────────────────────────────────────
+# Follow symlinks to find the real location of this script.
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+HOMELAB_ROOT="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+export HOMELAB_ROOT
+
+# ─── Global flag defaults ───────────────────────────────────────────
+export HOMELAB_JSON="false"
+export HOMELAB_DRY_RUN="false"
+export HOMELAB_NO_COLOR="false"
+
+# ─── Parse global flags (before subcommand) ──────────────────────────
+ARGS=()
+while (( $# > 0 )); do
+    case "$1" in
+        --json)      HOMELAB_JSON="true";    shift ;;
+        --dry-run)   HOMELAB_DRY_RUN="true"; shift ;;
+        --no-color)  HOMELAB_NO_COLOR="true"; shift ;;
+        -h|--help)   ARGS+=("help");          shift ;;
+        --version)   ARGS+=("version");       shift ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Run 'homelab help' for usage." >&2
+            exit 2
+            ;;
+        *)  ARGS+=("$1"); shift ;;
+    esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+# ─── Source shared library ───────────────────────────────────────────
+# shellcheck source=lib/common.sh
+source "${HOMELAB_ROOT}/lib/common.sh"
+
+# Re-init colors after flags are set
+_setup_colors
+
+# ─── Load configuration ─────────────────────────────────────────────
+load_config
+
+# ─── Usage ───────────────────────────────────────────────────────────
+usage() {
+    cat <<EOF
+${C_BOLD}${C_WHITE}homelab${C_RESET} — Proxmox VE homelab management CLI  ${C_DIM}v${HOMELAB_VERSION}${C_RESET}
+
+${C_BOLD}USAGE${C_RESET}
+    homelab [options] <command> [subcommand] [args...]
+
+${C_BOLD}OPTIONS${C_RESET}
+    --json        Output in JSON format
+    --dry-run     Preview changes without applying them
+    --no-color    Disable colored output
+    -h, --help    Show this help message
+    --version     Show version
+
+${C_BOLD}COMMANDS${C_RESET}
+    ${C_CYAN}doctor${C_RESET}       System health check
+    ${C_CYAN}storage${C_RESET}      Storage status and management
+    ${C_CYAN}container${C_RESET}    LXC container listing
+    ${C_CYAN}mount${C_RESET}        Bind mount inspection
+    ${C_CYAN}acl${C_RESET}          Access control list management
+    ${C_CYAN}service${C_RESET}      Service URL listing
+    ${C_CYAN}help${C_RESET}         Show this help message
+    ${C_CYAN}version${C_RESET}      Show version information
+
+${C_BOLD}EXAMPLES${C_RESET}
+    homelab doctor
+    homelab storage status
+    homelab container list
+    homelab mount list
+    homelab acl inspect 103
+    homelab acl grant 103 --dry-run
+    homelab service urls
+    homelab container list --json
+
+${C_DIM}Run 'homelab <command> --help' for command-specific help.${C_RESET}
+EOF
+}
+
+# ─── Version ─────────────────────────────────────────────────────────
+show_version() {
+    if [[ "${HOMELAB_JSON}" == "true" ]]; then
+        json_start
+        json_add_string "name" "homelab"
+        json_add_string "version" "${HOMELAB_VERSION}"
+        json_end
+    else
+        echo "${C_BOLD}homelab${C_RESET} v${HOMELAB_VERSION}"
+    fi
+}
+
+# ─── Subcommand dispatch ────────────────────────────────────────────
+COMMAND="${1:-}"
+shift 2>/dev/null || true
+
+case "${COMMAND}" in
+    doctor)
+        source "${HOMELAB_LIB}/doctor.sh"
+        cmd_doctor "$@"
+        ;;
+    storage)
+        source "${HOMELAB_LIB}/storage.sh"
+        cmd_storage "$@"
+        ;;
+    container)
+        source "${HOMELAB_LIB}/container.sh"
+        cmd_container "$@"
+        ;;
+    mount)
+        source "${HOMELAB_LIB}/mount.sh"
+        cmd_mount "$@"
+        ;;
+    acl)
+        source "${HOMELAB_LIB}/acl.sh"
+        cmd_acl "$@"
+        ;;
+    service)
+        source "${HOMELAB_LIB}/service.sh"
+        cmd_service "$@"
+        ;;
+    help|"")
+        usage
+        exit 0
+        ;;
+    version)
+        show_version
+        exit 0
+        ;;
+    *)
+        log_error "Unknown command: ${COMMAND}"
+        echo ""
+        echo "Run 'homelab help' for available commands."
+        exit 2
+        ;;
+esac
