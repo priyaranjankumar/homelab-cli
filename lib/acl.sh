@@ -67,19 +67,52 @@ _acl_get_uid_offset() {
     echo "${offset:-100000}"
 }
 
-# _acl_detect_service_user <vmid>
-#   Detect the primary service user (UID 1000) inside the container.
+# _acl_detect_service_user <vmid> <config>
+#   Detect the primary service user inside the container by checking:
+#   1. A user matching the service name configured in homelab.conf
+#   2. A user matching the container hostname
+#   3. Standard UID 1000 user
 #   Returns "username:uid" or "unknown:1000".
 _acl_detect_service_user() {
     local vmid="$1"
+    local config="$2"
+
+    local hostname
+    hostname="$(_acl_get_hostname "$config")"
+
+    # Try lookup from SERVICE_NAMES in config
+    local svc_name=""
+    if [[ -n "${SERVICE_NAMES:-}" ]]; then
+        svc_name="$(map_lookup "${SERVICE_NAMES}" "$vmid" 2>/dev/null | tr 'A-Z' 'a-z' || true)"
+        # Replace underscores back to hyphens if any
+        svc_name="${svc_name//_/-}"
+    fi
+
     local rootfs_paths=(
         "/var/lib/lxc/${vmid}/rootfs/etc/passwd"
         "/var/lib/lxc/${vmid}/etc/passwd"
     )
     for passwd_file in "${rootfs_paths[@]}"; do
         if [[ -r "$passwd_file" ]]; then
-            local user_line
-            user_line="$(awk -F: '$3 == 1000 { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
+            local user_line=""
+            
+            # 1. Try matching service name
+            if [[ -n "$svc_name" ]]; then
+                user_line="$(awk -F: -v u="$svc_name" '$1 == u { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
+            fi
+            
+            # 2. Try matching hostname (lowercased)
+            if [[ -z "$user_line" && -n "$hostname" ]]; then
+                local hn_lower
+                hn_lower="$(echo "$hostname" | tr 'A-Z' 'a-z')"
+                user_line="$(awk -F: -v u="$hn_lower" '$1 == u { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
+            fi
+            
+            # 3. Try fallback standard UID 1000
+            if [[ -z "$user_line" ]]; then
+                user_line="$(awk -F: '$3 == 1000 { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
+            fi
+            
             if [[ -n "$user_line" ]]; then
                 echo "$user_line"
                 return 0
@@ -194,7 +227,7 @@ _acl_inspect_data() {
 
     # Detect service user
     local service_info
-    service_info="$(_acl_detect_service_user "$vmid")"
+    service_info="$(_acl_detect_service_user "$vmid" "$config")"
     local service_user="${service_info%%:*}"
     local service_uid="${service_info##*:}"
 
