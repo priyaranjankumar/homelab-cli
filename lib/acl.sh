@@ -88,37 +88,58 @@ _acl_detect_service_user() {
         svc_name="${svc_name//_/-}"
     fi
 
-    local rootfs_paths=(
-        "/var/lib/lxc/${vmid}/rootfs/etc/passwd"
-        "/var/lib/lxc/${vmid}/etc/passwd"
-    )
-    for passwd_file in "${rootfs_paths[@]}"; do
-        if [[ -r "$passwd_file" ]]; then
-            local user_line=""
-            
-            # 1. Try matching service name
-            if [[ -n "$svc_name" ]]; then
-                user_line="$(awk -F: -v u="$svc_name" '$1 == u { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
-            fi
-            
-            # 2. Try matching hostname (lowercased)
-            if [[ -z "$user_line" && -n "$hostname" ]]; then
-                local hn_lower
-                hn_lower="$(echo "$hostname" | tr 'A-Z' 'a-z')"
-                user_line="$(awk -F: -v u="$hn_lower" '$1 == u { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
-            fi
-            
-            # 3. Try fallback standard UID 1000
-            if [[ -z "$user_line" ]]; then
-                user_line="$(awk -F: '$3 == 1000 { print $1":"$3; exit }' "$passwd_file" 2>/dev/null || true)"
-            fi
-            
-            if [[ -n "$user_line" ]]; then
-                echo "$user_line"
-                return 0
-            fi
+    # Read passwd contents (via pct exec if running, otherwise host rootfs)
+    local passwd_content=""
+    local read_success=false
+
+    if pct status "$vmid" 2>/dev/null | grep -q "running"; then
+        if passwd_content="$(pct exec "$vmid" -- cat /etc/passwd 2>/dev/null)"; then
+            read_success=true
         fi
-    done
+    fi
+
+    if [[ "$read_success" == "false" ]]; then
+        local rootfs_paths=(
+            "/var/lib/lxc/${vmid}/rootfs/etc/passwd"
+            "/var/lib/lxc/${vmid}/etc/passwd"
+        )
+        for passwd_file in "${rootfs_paths[@]}"; do
+            if [[ -r "$passwd_file" ]]; then
+                passwd_content="$(cat "$passwd_file" 2>/dev/null || true)"
+                if [[ -n "$passwd_content" ]]; then
+                    read_success=true
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [[ "$read_success" == "true" ]]; then
+        local user_line=""
+        
+        # 1. Try matching service name
+        if [[ -n "$svc_name" ]]; then
+            user_line="$(echo "$passwd_content" | awk -F: -v u="$svc_name" '$1 == u { print $1":"$3; exit }' 2>/dev/null || true)"
+        fi
+        
+        # 2. Try matching hostname (lowercased)
+        if [[ -z "$user_line" && -n "$hostname" ]]; then
+            local hn_lower
+            hn_lower="$(echo "$hostname" | tr 'A-Z' 'a-z')"
+            user_line="$(echo "$passwd_content" | awk -F: -v u="$hn_lower" '$1 == u { print $1":"$3; exit }' 2>/dev/null || true)"
+        fi
+        
+        # 3. Try fallback standard UID 1000
+        if [[ -z "$user_line" ]]; then
+            user_line="$(echo "$passwd_content" | awk -F: '$3 == 1000 { print $1":"$3; exit }' 2>/dev/null || true)"
+        fi
+        
+        if [[ -n "$user_line" ]]; then
+            echo "$user_line"
+            return 0
+        fi
+    fi
+
     echo "unknown:1000"
 }
 
