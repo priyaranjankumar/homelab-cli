@@ -82,6 +82,20 @@ To uninstall and remove the symlink:
 sudo ./install.sh --uninstall
 ```
 
+### 📦 Pushing to GitHub (Optional)
+
+If you want to push this repository to your own GitHub account using the GitHub CLI (`gh`):
+
+```bash
+# Initialize git and add files
+git init
+git add .
+git commit -m "Initial commit of homelab-cli"
+
+# Create a public repository and push
+gh repo create homelab-cli --public --source=. --remote=origin --push
+```
+
 ---
 
 ## 🔧 Configuration
@@ -104,6 +118,30 @@ SERVICE_PORTS="100:32400 101:8010 102:8080 103:3000"
 # Default UID offset for unprivileged LXC containers (Proxmox default is 100000)
 ACL_UID_OFFSET="100000"
 ```
+
+### 🔍 How to Find These Settings on Your Proxmox Node
+
+If you are not sure what values to fill in your `homelab.conf`, run these diagnostic commands on your Proxmox server:
+
+1. **Find Container VMIDs & Names**:
+   Run `pct list`. This lists all local containers:
+   ```bash
+   pct list
+   ```
+   *Map the VMIDs to your names in `SERVICE_NAMES` (e.g., `100:Plex 101:Homer`).*
+
+2. **Find Container Service Ports**:
+   If you don't know which port a service is running on inside container `100`, query its open ports:
+   ```bash
+   pct exec 100 -- ss -tlnp
+   ```
+
+3. **Find Mount Points**:
+   To see what host folders are mapped to containers:
+   ```bash
+   homelab mount list
+   ```
+   *Set `DATA_ROOT` to the common parent path (like `/srv/data`) and list the directories in `DATA_DIRS`.*
 
 ---
 
