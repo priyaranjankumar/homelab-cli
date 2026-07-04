@@ -248,6 +248,9 @@ ACL Inspection — Container 103
 ──────────────────────────────────────────────────
 ```
 
+> [!IMPORTANT]
+**Prerequisite**: The container must have at least one bind mount configured in Proxmox (e.g., `mp0: /host/path,mp=/container/path`) before you can inspect or grant ACLs. If a container only has its root filesystem (`/`), the ACL tool will have no paths to manage.
+
 #### Grant ACLs:
 Grants read, write, and execute permissions recursively, including **Default ACLs** so newly created files inherit access permissions.
 ```bash

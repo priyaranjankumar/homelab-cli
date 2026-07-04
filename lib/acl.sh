@@ -183,7 +183,7 @@ _acl_parse_bind_mounts() {
         if [[ -n "$host_path" && -n "$container_path" ]]; then
             echo "${host_path}|${container_path}"
         fi
-    done
+    done || true
 }
 
 # _acl_check_access <host_path> <mapped_uid>
@@ -257,6 +257,8 @@ _acl_inspect_data() {
             json_end
         else
             log_warn "No bind mounts found for container ${vmid} (${hostname})."
+            log_info "To add a bind mount in Proxmox, run on the host:"
+            log_info "  pct set ${vmid} -mp0 /srv/data/yourfolder,mp=/yourfolder"
         fi
         return 0
     fi
