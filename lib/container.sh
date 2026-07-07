@@ -273,7 +273,7 @@ if [[ -d "/etc/update-motd.d" ]]; then
 fi
 EXECEOF
 
-    log_success "Successfully configured console for container $vmid."
+    log_ok "Successfully configured console for container $vmid."
     echo ""
     log_info "To connect, run: pct console $vmid"
     echo ""
