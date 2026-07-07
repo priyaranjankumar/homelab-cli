@@ -5,13 +5,14 @@
 # ─── Help ────────────────────────────────────────────────────────────
 _container_usage() {
     cat <<EOF
-${C_BOLD}${C_WHITE}homelab container${C_RESET} — LXC container listing
+${C_BOLD}${C_WHITE}homelab container${C_RESET} — LXC container management
 
 ${C_BOLD}USAGE${C_RESET}
     homelab container [subcommand] [options]
 
 ${C_BOLD}SUBCOMMANDS${C_RESET}
-    ${C_CYAN}list${C_RESET}    List all LXC containers (default)
+    ${C_CYAN}list${C_RESET}             List all LXC containers (default)
+    ${C_CYAN}setup-console${C_RESET}    Configure LXC console for root autologin and MOTD
 
 ${C_BOLD}OPTIONS${C_RESET}
     --json        Output in JSON format
@@ -19,8 +20,8 @@ ${C_BOLD}OPTIONS${C_RESET}
 
 ${C_BOLD}EXAMPLES${C_RESET}
     homelab container
-    homelab container list
     homelab container list --json
+    homelab container setup-console 103
 
 ${C_DIM}Requires: pct (Proxmox container toolkit)${C_RESET}
 EOF
@@ -186,6 +187,98 @@ _container_list() {
     log_info "${count} container(s) found."
 }
 
+# ─── Setup Console ──────────────────────────────────────────────────
+_container_setup_console() {
+    local vmid="$1"
+    if [[ -z "$vmid" ]]; then
+        log_error "Missing container ID."
+        echo ""
+        _container_usage
+        exit 2
+    fi
+
+    require_cmd "pct" "Proxmox container toolkit"
+
+    # Verify container exists
+    if ! pct status "$vmid" >/dev/null 2>&1; then
+        log_error "Container $vmid does not exist."
+        exit 1
+    fi
+
+    # Check if container is running
+    local status
+    status="$(pct status "$vmid" | awk '{print $2}')"
+    if [[ "$status" != "running" ]]; then
+        log_error "Container $vmid is not running (status: $status)."
+        log_error "Please start the container before configuring its console."
+        exit 1
+    fi
+
+    log_info "Configuring root console autologin and MOTD for container $vmid..."
+
+    # Configure inside the container
+    pct exec "$vmid" -- bash <<'EXECEOF'
+set -euo pipefail
+
+# 1. Configure agetty for autologin
+GETTY_OVERRIDE="/etc/systemd/system/container-getty@1.service.d/override.conf"
+mkdir -p "$(dirname "$GETTY_OVERRIDE")"
+cat <<'EOF' >"$GETTY_OVERRIDE"
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear --keep-baud tty%I 115200,38400,9600 $TERM
+EOF
+
+systemctl daemon-reload
+systemctl restart container-getty@1.service || true
+
+# 2. Add TERM to root .bashrc
+if [ -f /root/.bashrc ] && ! grep -qxF "export TERM='xterm-256color'" /root/.bashrc; then
+    echo "export TERM='xterm-256color'" >>/root/.bashrc
+fi
+
+# 3. Create MOTD profile script
+PROFILE_FILE="/etc/profile.d/00_homelab-motd.sh"
+cat <<'EOF' >"$PROFILE_FILE"
+[ -t 1 ] || return 0
+
+# Colors
+C_RESET="\e[0m"
+C_BOLD="\e[1m"
+C_GREEN="\e[32m"
+C_YELLOW="\e[33m"
+
+# Get details
+os_display="Unknown OS"
+if [ -r /etc/os-release ]; then
+    # shellcheck source=/dev/null
+    . /etc/os-release
+    os_display="${PRETTY_NAME:-${NAME:-Unknown OS}}"
+fi
+ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$ip_addr" ]] && ip_addr="-"
+
+echo -e ""
+echo -e "${C_BOLD}$(hostname) LXC Container${C_RESET}"
+echo -e "    🌐   ${C_YELLOW}Provided by:${C_RESET} ${C_GREEN}homelab-cli${C_RESET}"
+echo -e "    🖥️   ${C_YELLOW}OS:${C_RESET} ${C_GREEN}${os_display}${C_RESET}"
+echo -e "    🏠   ${C_YELLOW}Hostname:${C_RESET} ${C_GREEN}$(hostname)${C_RESET}"
+echo -e "    💡   ${C_YELLOW}IP Address:${C_RESET} ${C_GREEN}${ip_addr}${C_RESET}"
+echo -e ""
+EOF
+
+# 4. Disable default update-motd.d scripts if they exist
+if [[ -d "/etc/update-motd.d" ]]; then
+    chmod -x /etc/update-motd.d/* 2>/dev/null || true
+fi
+EXECEOF
+
+    log_success "Successfully configured console for container $vmid."
+    echo ""
+    log_info "To connect, run: pct console $vmid"
+    echo ""
+}
+
 # ─── Entry point ─────────────────────────────────────────────────────
 cmd_container() {
     local subcmd="${1:-list}"
@@ -194,6 +287,9 @@ cmd_container() {
     case "$subcmd" in
         list)
             _container_list "$@"
+            ;;
+        setup-console)
+            _container_setup_console "$@"
             ;;
         -h|--help|help)
             _container_usage
