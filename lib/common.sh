@@ -221,6 +221,9 @@ json_object() {
 confirm() {
     # Usage: confirm "Do something dangerous?" || return
     local prompt="${1:-Continue?}"
+    if [[ "${HOMELAB_YES:-false}" == "true" ]]; then
+        return 0
+    fi
     if [[ "${HOMELAB_DRY_RUN}" == "true" ]]; then
         log_info "DRY RUN — skipping confirmation: ${prompt}"
         return 1  # Don't proceed in dry-run

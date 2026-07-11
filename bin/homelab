@@ -14,6 +14,7 @@ export HOMELAB_ROOT
 export HOMELAB_JSON="false"
 export HOMELAB_DRY_RUN="false"
 export HOMELAB_NO_COLOR="false"
+export HOMELAB_YES="false"
 
 # ─── Parse global flags (before subcommand) ──────────────────────────
 ARGS=()
@@ -22,6 +23,7 @@ while (( $# > 0 )); do
         --json)      HOMELAB_JSON="true";    shift ;;
         --dry-run)   HOMELAB_DRY_RUN="true"; shift ;;
         --no-color)  HOMELAB_NO_COLOR="true"; shift ;;
+        -y|--yes)    HOMELAB_YES="true";     shift ;;
         -h|--help)   ARGS+=("help");          shift ;;
         --version)   ARGS+=("version");       shift ;;
         -*)
@@ -56,6 +58,7 @@ ${C_BOLD}OPTIONS${C_RESET}
     --json        Output in JSON format
     --dry-run     Preview changes without applying them
     --no-color    Disable colored output
+    -y, --yes     Bypass confirmation prompts (auto-approve)
     -h, --help    Show this help message
     --version     Show version
 
