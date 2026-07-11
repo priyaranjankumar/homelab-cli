@@ -645,14 +645,9 @@ _acl_grant() {
             needs_acl=true
         fi
 
-        local target_dir=""
-        if [[ "$needs_inject" == "true" ]]; then
-            local rootfs="/var/lib/lxc/${vmid}/rootfs"
-            target_dir="${rootfs}${container_path}"
-            target_dir="$(echo "$target_dir" | tr -s '/')"
-        fi
-
-        local cmd_mount="mount --bind ${host_path} ${target_dir}"
+        local container_pid
+        container_pid="$(lxc-info -n "$vmid" -p -H 2>/dev/null || true)"
+        local cmd_mount="nsenter -t ${container_pid:-<pid>} -m mount --bind ${host_path} ${container_path} (via fd)"
         local cmd_acl_set="setfacl -R -m u:${mapped_uid}:rwX ${host_path}"
         local cmd_acl_default="setfacl -R -d -m u:${mapped_uid}:rwX ${host_path}"
 
@@ -668,8 +663,9 @@ _acl_grant() {
 
             if [[ "$needs_inject" == "true" ]]; then
                 log_info "Needs to be injected into running container namespace"
-                echo "  ${C_DIM}Command:${C_RESET} mkdir -p ${target_dir}"
-                echo "  ${C_DIM}Command:${C_RESET} ${cmd_mount}"
+                echo "  ${C_DIM}Command:${C_RESET} nsenter -t ${container_pid:-<pid>} -m mkdir -p \$(dirname ${container_path})"
+                echo "  ${C_DIM}Command:${C_RESET} nsenter -t ${container_pid:-<pid>} -m [mkdir/touch] ${container_path}"
+                echo "  ${C_DIM}Command:${C_RESET} exec 3< ${host_path} && nsenter -t ${container_pid:-<pid>} -m mount --bind /proc/self/fd/3 ${container_path} && exec 3<&-"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 log_info "Mapped UID ${mapped_uid} (${service_user}) needs access to ${host_path}"
@@ -681,8 +677,13 @@ _acl_grant() {
         # Dry-run check
         if [[ "${HOMELAB_DRY_RUN}" == "true" ]]; then
             if [[ "$needs_inject" == "true" ]]; then
-                dry_run_guard "mkdir -p ${target_dir}"
-                dry_run_guard "${cmd_mount}"
+                dry_run_guard "nsenter -t ${container_pid} -m mkdir -p \$(dirname ${container_path})"
+                if [[ -d "$host_path" ]]; then
+                    dry_run_guard "nsenter -t ${container_pid} -m mkdir -p ${container_path}"
+                else
+                    dry_run_guard "nsenter -t ${container_pid} -m touch ${container_path}"
+                fi
+                dry_run_guard "exec 3< ${host_path} && nsenter -t ${container_pid} -m mount --bind /proc/self/fd/3 ${container_path} && exec 3<&-"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 dry_run_guard "${cmd_acl_set}"
@@ -735,22 +736,30 @@ _acl_grant() {
         local inject_success=true
         if [[ "$needs_inject" == "true" ]]; then
             log_info "Injecting mount..."
-            local parent_target="$(dirname "$target_dir")"
-            if mkdir -p "$parent_target"; then
-                if [[ -d "$host_path" ]]; then
-                    mkdir -p "$target_dir"
+            if [[ -n "$container_pid" && "$container_pid" != "0" ]]; then
+                local parent_target="$(dirname "$container_path")"
+                if nsenter -t "$container_pid" -m mkdir -p "$parent_target" 2>/dev/null; then
+                    if [[ -d "$host_path" ]]; then
+                        nsenter -t "$container_pid" -m mkdir -p "$container_path" 2>/dev/null
+                    else
+                        nsenter -t "$container_pid" -m touch "$container_path" 2>/dev/null
+                    fi
+                    
+                    exec 3< "$host_path"
+                    if nsenter -t "$container_pid" -m mount --bind /proc/self/fd/3 "$container_path" 2>/dev/null; then
+                        log_ok "Mount injected successfully."
+                        injections_made=true
+                    else
+                        log_error "Failed to inject mount via namespace nsenter."
+                        inject_success=false
+                    fi
+                    exec 3<&-
                 else
-                    touch "$target_dir"
-                fi
-                if mount --bind "$host_path" "$target_dir"; then
-                    log_ok "Mount injected successfully."
-                    injections_made=true
-                else
-                    log_error "Failed to inject mount."
+                    log_error "Failed to create target parent directory inside container."
                     inject_success=false
                 fi
             else
-                log_error "Failed to create target parent directory."
+                log_error "Container is not running. Cannot inject mount."
                 inject_success=false
             fi
         fi
