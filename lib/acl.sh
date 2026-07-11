@@ -126,6 +126,48 @@ _acl_expand_mounts() {
     done <<< "$mounts"
 }
 
+# _acl_mount_in_config <vmid> <host_path> <container_path>
+#   Check if a mount entry already exists in the Proxmox LXC config.
+_acl_mount_in_config() {
+    local vmid="$1"
+    local host_path="$2"
+    local container_path="$3"
+    local config_file="/etc/pve/lxc/${vmid}.conf"
+    local dest="${container_path#/}"
+
+    [[ ! -f "$config_file" ]] && return 1
+
+    # Check for lxc.mount.entry with this source and destination
+    if grep -q "^lxc\.mount\.entry:.*${host_path}[[:space:]]\+${dest}[[:space:]]" "$config_file" 2>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+# _acl_add_mount_entry <vmid> <host_path> <container_path>
+#   Add a lxc.mount.entry line to the Proxmox LXC config file.
+_acl_add_mount_entry() {
+    local vmid="$1"
+    local host_path="$2"
+    local container_path="$3"
+    local config_file="/etc/pve/lxc/${vmid}.conf"
+    local dest="${container_path#/}"
+
+    local entry="lxc.mount.entry: ${host_path} ${dest} none bind,optional,create=dir 0 0"
+
+    # Already present?
+    if _acl_mount_in_config "$vmid" "$host_path" "$container_path"; then
+        return 0
+    fi
+
+    if echo "$entry" >> "$config_file"; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # _acl_get_config <vmid>
 #   Retrieve the pct config for a container, or fail.
 _acl_get_config() {
@@ -412,46 +454,62 @@ _acl_inspect_data() {
             local access
             access="$(_acl_check_access "$host_path" "$mapped_uid")"
 
-            # Check if injected (only for submount and symlink)
-            local injected=true
-            local target_dir=""
-            if [[ "$is_running" == "true" ]] && [[ "$type" == "submount" || "$type" == "symlink" ]]; then
-                local container_pid
-                container_pid="$(lxc-info -n "$vmid" -p -H 2>/dev/null || true)"
-                if [[ -n "$container_pid" && "$container_pid" != "0" && -f "/proc/${container_pid}/mountinfo" ]]; then
-                    if awk -v mp="${container_path}" '$5 == mp {exit 0} END {exit 1}' "/proc/${container_pid}/mountinfo" 2>/dev/null; then
-                        injected=true
+            # Check if mount is active and/or configured (only for submount and symlink)
+            local mount_active=true
+            local mount_configured=true
+            if [[ "$type" == "submount" || "$type" == "symlink" ]]; then
+                # Check if configured in Proxmox LXC config
+                if ! _acl_mount_in_config "$vmid" "$host_path" "$container_path"; then
+                    mount_configured=false
+                fi
+
+                # Check if active inside the running container
+                if [[ "$is_running" == "true" ]]; then
+                    local container_pid
+                    container_pid="$(lxc-info -n "$vmid" -p -H 2>/dev/null || true)"
+                    if [[ -n "$container_pid" && "$container_pid" != "0" && -f "/proc/${container_pid}/mountinfo" ]]; then
+                        if ! awk -v mp="${container_path}" '$5 == mp {exit 0} END {exit 1}' "/proc/${container_pid}/mountinfo" 2>/dev/null; then
+                            mount_active=false
+                        fi
                     else
-                        injected=false
+                        mount_active=false
                     fi
                 else
-                    # Fallback to host mountpoint check if we can't read mountinfo
-                    local rootfs="/var/lib/lxc/${vmid}/rootfs"
-                    target_dir="${rootfs}${container_path}"
-                    target_dir="$(echo "$target_dir" | tr -s '/')"
-                    if ! mountpoint -q "$target_dir" 2>/dev/null; then
-                        injected=false
-                    fi
+                    # Container is stopped — can't verify, trust config
+                    mount_active="$mount_configured"
                 fi
             fi
 
             # Determine recommendation
             local recommendation="OK"
+            local needs_access=false
             if [[ "$access" == "path_missing" ]]; then
                 recommendation="Path does not exist on host"
                 access="N/A"
-            elif [[ "$injected" == "false" ]]; then
-                if [[ "$access" == "None" ]]; then
-                    recommendation="Inject mount & Grant RWX"
-                elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null || [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
-                    recommendation="Inject mount & Grant RWX"
+            elif [[ "$access" == "None" ]] || { ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null || [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; }; then
+                needs_access=true
+            fi
+
+            if [[ "$recommendation" != "Path does not exist on host" ]]; then
+                if [[ "$mount_active" == "true" ]]; then
+                    if [[ "$needs_access" == "true" ]]; then
+                        recommendation="Grant RWX"
+                    else
+                        recommendation="OK"
+                    fi
+                elif [[ "$mount_configured" == "true" ]]; then
+                    if [[ "$needs_access" == "true" ]]; then
+                        recommendation="Restart container & Grant RWX"
+                    else
+                        recommendation="Restart container"
+                    fi
                 else
-                    recommendation="Inject mount"
+                    if [[ "$needs_access" == "true" ]]; then
+                        recommendation="Add mount entry & Grant RWX"
+                    else
+                        recommendation="Add mount entry"
+                    fi
                 fi
-            elif [[ "$access" == "None" ]]; then
-                recommendation="Grant RWX"
-            elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null || [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
-                recommendation="Grant RWX (insufficient)"
             fi
 
             # Store result for grant reuse
@@ -597,9 +655,8 @@ _acl_grant() {
 
     require_root
     require_cmd setfacl "ACL modification tool"
-    require_cmd lxc-attach "LXC container attachment tool"
 
-    local injections_made=false
+    local config_changed=false
 
     if [[ "${HOMELAB_JSON}" != "true" ]]; then
         print_header "ACL Grant — Container ${vmid}"
@@ -629,6 +686,11 @@ _acl_grant() {
             continue
         fi
 
+        # Skip if only a restart is needed (config already has the entry)
+        if [[ "$recommendation" == "Restart container" ]]; then
+            continue
+        fi
+
         # Skip if path is missing
         if [[ "$recommendation" == "Path does not exist on host" ]]; then
             log_warn "Skipping ${host_path}: path does not exist on host."
@@ -637,36 +699,33 @@ _acl_grant() {
 
         changes_needed=true
 
-        local needs_inject=false
+        local needs_mount_entry=false
         local needs_acl=false
-        if [[ "$recommendation" == *"Inject mount"* ]]; then
-            needs_inject=true
+        if [[ "$recommendation" == *"Add mount entry"* ]]; then
+            needs_mount_entry=true
         fi
         if [[ "$recommendation" == *"Grant RWX"* ]]; then
             needs_acl=true
         fi
 
-        local container_pid
-        container_pid="$(lxc-info -n "$vmid" -p -H 2>/dev/null || true)"
-        local cmd_mount="nsenter -t ${container_pid:-<pid>} -m mount --bind ${host_path} ${container_path} (via fd)"
         local cmd_acl_set="setfacl -R -m u:${mapped_uid}:rwX ${host_path}"
         local cmd_acl_default="setfacl -R -d -m u:${mapped_uid}:rwX ${host_path}"
+        local dest="${container_path#/}"
+        local cmd_config="echo 'lxc.mount.entry: ${host_path} ${dest} none bind,optional,create=dir 0 0' >> /etc/pve/lxc/${vmid}.conf"
 
         if [[ "${HOMELAB_JSON}" != "true" ]]; then
             echo ""
             if [[ "$type" == "submount" ]]; then
-                print_section "Sub-mount Injection: ${host_path} → ${container_path}"
+                print_section "Sub-mount: ${host_path} → ${container_path}"
             elif [[ "$type" == "symlink" ]]; then
-                print_section "Symlink Injection: ${host_path} (target of ${extra_info}) → ${container_path}"
+                print_section "Symlink target: ${host_path} (target of ${extra_info}) → ${container_path}"
             else
                 print_section "Bind Mount: ${host_path} → ${container_path}"
             fi
 
-            if [[ "$needs_inject" == "true" ]]; then
-                log_info "Needs to be injected into running container namespace"
-                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- mkdir -p \$(dirname ${container_path})"
-                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- [mkdir/touch] ${container_path}"
-                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
+            if [[ "$needs_mount_entry" == "true" ]]; then
+                log_info "Will add mount entry to Proxmox config"
+                echo "  ${C_DIM}Config:${C_RESET} lxc.mount.entry: ${host_path} ${dest} none bind,optional,create=dir 0 0"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 log_info "Mapped UID ${mapped_uid} (${service_user}) needs access to ${host_path}"
@@ -677,14 +736,8 @@ _acl_grant() {
 
         # Dry-run check
         if [[ "${HOMELAB_DRY_RUN}" == "true" ]]; then
-            if [[ "$needs_inject" == "true" ]]; then
-                dry_run_guard "lxc-attach -n ${vmid} -- mkdir -p \$(dirname ${container_path})"
-                if [[ -d "$host_path" ]]; then
-                    dry_run_guard "lxc-attach -n ${vmid} -- mkdir -p ${container_path}"
-                else
-                    dry_run_guard "lxc-attach -n ${vmid} -- touch ${container_path}"
-                fi
-                dry_run_guard "lxc-attach -n ${vmid} -- mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
+            if [[ "$needs_mount_entry" == "true" ]]; then
+                dry_run_guard "$cmd_config"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 dry_run_guard "${cmd_acl_set}"
@@ -699,11 +752,8 @@ _acl_grant() {
                     "mapped_uid" "$mapped_uid" \
                     "type" "$type" \
                     "action" "dry_run" \
-                    "needs_inject" "$needs_inject" \
-                    "needs_acl" "$needs_acl" \
-                    "command_mount" "$cmd_mount" \
-                    "command_acl" "$cmd_acl_set" \
-                    "command_default" "$cmd_acl_default")"
+                    "needs_mount_entry" "$needs_mount_entry" \
+                    "needs_acl" "$needs_acl")"
                 if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
                 json_grant_items+="$item"
             fi
@@ -712,10 +762,10 @@ _acl_grant() {
 
         # Confirm with user
         local confirm_msg="Apply changes for ${host_path}?"
-        if [[ "$needs_inject" == "true" && "$needs_acl" == "true" ]]; then
-            confirm_msg="Inject mount and apply ACLs on ${host_path}?"
-        elif [[ "$needs_inject" == "true" ]]; then
-            confirm_msg="Inject mount from ${host_path} into container?"
+        if [[ "$needs_mount_entry" == "true" && "$needs_acl" == "true" ]]; then
+            confirm_msg="Add mount config entry and apply ACLs for ${host_path}?"
+        elif [[ "$needs_mount_entry" == "true" ]]; then
+            confirm_msg="Add mount config entry for ${host_path}?"
         fi
 
         if ! confirm "$confirm_msg"; then
@@ -734,38 +784,20 @@ _acl_grant() {
         fi
 
         # Apply changes
-        local inject_success=true
-        if [[ "$needs_inject" == "true" ]]; then
-            log_info "Injecting mount..."
-            if [[ -n "$container_pid" && "$container_pid" != "0" ]]; then
-                local parent_target="$(dirname "$container_path")"
-                local err_msg
-                if err_msg="$(lxc-attach -n "$vmid" -- mkdir -p "$parent_target" 2>&1)"; then
-                    if [[ -d "$host_path" ]]; then
-                        lxc-attach -n "$vmid" -- mkdir -p "$container_path" >/dev/null 2>&1
-                    else
-                        lxc-attach -n "$vmid" -- touch "$container_path" >/dev/null 2>&1
-                    fi
-                    
-                    if err_msg="$(lxc-attach -n "$vmid" -- mount --bind /proc/self/fd/3 "$container_path" 3< "$host_path" 2>&1)"; then
-                        log_ok "Mount injected successfully."
-                        injections_made=true
-                    else
-                        log_error "Failed to inject mount via namespace lxc-attach: ${err_msg}"
-                        inject_success=false
-                    fi
-                else
-                    log_error "Failed to create target parent directory inside container: ${err_msg}"
-                    inject_success=false
-                fi
+        local mount_success=true
+        if [[ "$needs_mount_entry" == "true" ]]; then
+            log_info "Adding mount entry to Proxmox config..."
+            if _acl_add_mount_entry "$vmid" "$host_path" "$container_path"; then
+                log_ok "Mount entry added to /etc/pve/lxc/${vmid}.conf"
+                config_changed=true
             else
-                log_error "Container is not running. Cannot inject mount."
-                inject_success=false
+                log_error "Failed to write mount entry to config."
+                mount_success=false
             fi
         fi
 
         local acl_success=true
-        if [[ "$needs_acl" == "true" && "$inject_success" == "true" ]]; then
+        if [[ "$needs_acl" == "true" && "$mount_success" == "true" ]]; then
             log_info "Applying ACLs on ${host_path}..."
             if eval "$cmd_acl_set" && eval "$cmd_acl_default"; then
                 # Verify
@@ -783,7 +815,7 @@ _acl_grant() {
             fi
         fi
 
-        if [[ "$inject_success" == "true" && "$acl_success" == "true" ]]; then
+        if [[ "$mount_success" == "true" && "$acl_success" == "true" ]]; then
             if [[ "${HOMELAB_JSON}" == "true" ]]; then
                 local item
                 item="$(json_object \
@@ -810,21 +842,20 @@ _acl_grant() {
         fi
     done
 
-    # Configure persistence hook if needed
-    if [[ "$injections_made" == "true" ]] && [[ "${HOMELAB_DRY_RUN}" != "true" ]]; then
-        # Reload hookscript config
-        local updated_config
-        updated_config="$(_acl_get_config "$vmid")"
-        local current_hook
-        current_hook="$(echo "$updated_config" | grep -oP '^hookscript:\s*\K\S+' || true)"
-        
-        if [[ -z "$current_hook" ]]; then
-            if [[ "${HOMELAB_JSON}" != "true" ]]; then
-                echo ""
-                log_info "Reboot persistence is not configured for container $vmid."
-                if confirm "Configure a Proxmox boot hookscript to automate this injection on reboot?"; then
-                    _acl_setup_hookscript "$vmid"
+    # If config was changed, prompt for container restart
+    if [[ "$config_changed" == "true" ]] && [[ "${HOMELAB_DRY_RUN}" != "true" ]]; then
+        if [[ "${HOMELAB_JSON}" != "true" ]]; then
+            echo ""
+            log_info "Container config has been updated. A restart is required for the new mounts to take effect."
+            if confirm "Restart container ${vmid} now?"; then
+                log_info "Restarting container ${vmid}..."
+                if pct reboot "$vmid" 2>/dev/null; then
+                    log_ok "Container ${vmid} restarted successfully."
+                else
+                    log_error "Failed to restart container ${vmid}. Please restart manually: pct reboot ${vmid}"
                 fi
+            else
+                log_warn "Restart skipped. Run 'pct reboot ${vmid}' to apply mount changes."
             fi
         fi
     fi

@@ -226,12 +226,17 @@ homelab mount list
 ### `homelab acl`
 Inspects and modifies filesystem permissions on PVE host data paths bound to LXC containers.
 
-It also automatically detects and resolves **split-namespace issues** caused by non-recursive LXC bind mounts on running containers:
-1. **Sub-mounts:** Discovers active host mount points under parent bind mounts (e.g. `/srv/data/media/Movies` under `/srv/data`) and mounts them recursively into the running container namespace.
-2. **Symlinks:** Discovers symlinks pointing outside the parent path and mounts their targets inside the container (resolving both absolute and relative targets dynamically).
+It also automatically detects **split-namespace issues** caused by non-recursive LXC bind mounts:
+1. **Sub-mounts:** Discovers active host mount points under parent bind mounts (e.g. `/srv/data/media/Movies` under `/srv/data`) that are not visible inside the container.
+2. **Symlinks:** Discovers symlinks pointing outside the parent path and whose targets are not available inside the container.
+
+When these are detected, the tool writes `lxc.mount.entry` lines directly to the Proxmox container config (`/etc/pve/lxc/<vmid>.conf`) and prompts for a container restart so LXC can set up the mounts natively.
+
+> [!NOTE]
+> **Why not inject mounts at runtime?** Linux kernel security prevents bind-mounting host filesystems into an unprivileged container's user namespace from within that namespace. The only reliable approach is configuring them in the LXC config so Proxmox sets them up before namespace isolation begins.
 
 #### Inspect ACLs:
-Inspects whether the unprivileged container mapping UID has access to host paths, and checks if sub-mounts or symlinks need namespace injection.
+Inspects whether the unprivileged container mapping UID has access to host paths, and checks if sub-mounts or symlinks need to be added to the container config.
 ```bash
 homelab acl inspect 103
 ```
@@ -245,41 +250,29 @@ Container Info
 ──────────────
   VMID:                103
   Hostname:            nextexplorer
-  Persistence Hook:    Not configured (Injections will not persist on reboot)
+  Persistence Hook:    Not configured
 ──────────────────────────────────────────────────
-  Bind Mount:          /srv/data/media → /media
+  Bind Mount:          /srv/data → /data
   Filesystem Owner:    root:root
   Service User:        explorer (UID 1000)
   Mapped Host UID:     101000
-  Current Access:      None
-  Recommendation:      Grant RWX
+  Current Access:      rwx
+  Recommendation:      OK
 ──────────────────────────────────────────────────
-  Bind Mount:          /srv/storage/Movies → /media/Movies (Sub-mount)
+  Bind Mount:          /srv/data/media/Movies → /data/media/Movies (Sub-mount)
   Filesystem Owner:    root:root
   Service User:        explorer (UID 1000)
   Mapped Host UID:     101000
-  Current Access:      None
-  Recommendation:      Inject mount & Grant RWX
+  Current Access:      rwx
+  Recommendation:      Add mount entry
 ──────────────────────────────────────────────────
 ```
 
 > [!IMPORTANT]
 > **Prerequisite**: The container must have at least one bind mount configured in Proxmox (e.g., `mp0: /host/path,mp=/container/path`) before you can inspect or grant ACLs. If a container only has its root filesystem (`/`), the ACL tool will have no paths to manage.
 
-#### Grant ACLs & Inject Mounts:
-Grants read, write, and execute permissions recursively (including **Default ACLs** so newly created files inherit access permissions) and dynamically mounts sub-mounts/symlinks directly into the container's active rootfs overlay (`/var/lib/lxc/<vmid>/rootfs/`) via mount propagation on the host.
-
-If the container doesn't have reboot persistence configured, the tool will automatically prompt you:
-```text
-Reboot persistence is not configured for container 103.
-Configure a Proxmox boot hookscript to automate this injection on reboot? [y/N]
-```
-If you say **Yes**, it will:
-1. Ensure the PVE snippets directory exists on the host (`/var/lib/vz/snippets/`).
-2. Write a shared hookscript at `/var/lib/vz/snippets/homelab-hook.sh`.
-3. Register it with the container via `pct set 103 --hookscript local:snippets/homelab-hook.sh`.
-
-Once configured, the hookscript automatically runs `homelab acl grant 103 --yes --no-color` on container start (`post-start` phase) and saves logs to `/var/log/homelab-hook-103.log`.
+#### Grant ACLs & Add Mount Entries:
+Grants read, write, and execute permissions recursively (including **Default ACLs** so newly created files inherit access permissions). For sub-mounts and symlink targets not visible inside the container, it adds `lxc.mount.entry` lines to `/etc/pve/lxc/<vmid>.conf` with `bind,optional,create=dir` options and prompts for a container restart.
 
 ```bash
 sudo homelab acl grant 103
