@@ -597,6 +597,7 @@ _acl_grant() {
 
     require_root
     require_cmd setfacl "ACL modification tool"
+    require_cmd lxc-attach "LXC container attachment tool"
 
     local injections_made=false
 
@@ -663,9 +664,9 @@ _acl_grant() {
 
             if [[ "$needs_inject" == "true" ]]; then
                 log_info "Needs to be injected into running container namespace"
-                echo "  ${C_DIM}Command:${C_RESET} nsenter -t ${container_pid:-<pid>} -m -p mkdir -p \$(dirname ${container_path})"
-                echo "  ${C_DIM}Command:${C_RESET} nsenter -t ${container_pid:-<pid>} -m -p [mkdir/touch] ${container_path}"
-                echo "  ${C_DIM}Command:${C_RESET} nsenter -t ${container_pid:-<pid>} -m -p mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
+                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- mkdir -p \$(dirname ${container_path})"
+                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- [mkdir/touch] ${container_path}"
+                echo "  ${C_DIM}Command:${C_RESET} lxc-attach -n ${vmid} -- mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 log_info "Mapped UID ${mapped_uid} (${service_user}) needs access to ${host_path}"
@@ -677,13 +678,13 @@ _acl_grant() {
         # Dry-run check
         if [[ "${HOMELAB_DRY_RUN}" == "true" ]]; then
             if [[ "$needs_inject" == "true" ]]; then
-                dry_run_guard "nsenter -t ${container_pid} -m -p mkdir -p \$(dirname ${container_path})"
+                dry_run_guard "lxc-attach -n ${vmid} -- mkdir -p \$(dirname ${container_path})"
                 if [[ -d "$host_path" ]]; then
-                    dry_run_guard "nsenter -t ${container_pid} -m -p mkdir -p ${container_path}"
+                    dry_run_guard "lxc-attach -n ${vmid} -- mkdir -p ${container_path}"
                 else
-                    dry_run_guard "nsenter -t ${container_pid} -m -p touch ${container_path}"
+                    dry_run_guard "lxc-attach -n ${vmid} -- touch ${container_path}"
                 fi
-                dry_run_guard "nsenter -t ${container_pid} -m -p mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
+                dry_run_guard "lxc-attach -n ${vmid} -- mount --bind /proc/self/fd/3 ${container_path} 3< ${host_path}"
             fi
             if [[ "$needs_acl" == "true" ]]; then
                 dry_run_guard "${cmd_acl_set}"
@@ -739,18 +740,18 @@ _acl_grant() {
             if [[ -n "$container_pid" && "$container_pid" != "0" ]]; then
                 local parent_target="$(dirname "$container_path")"
                 local err_msg
-                if err_msg="$(nsenter -t "$container_pid" -m -p mkdir -p "$parent_target" 2>&1)"; then
+                if err_msg="$(lxc-attach -n "$vmid" -- mkdir -p "$parent_target" 2>&1)"; then
                     if [[ -d "$host_path" ]]; then
-                        nsenter -t "$container_pid" -m -p mkdir -p "$container_path" >/dev/null 2>&1
+                        lxc-attach -n "$vmid" -- mkdir -p "$container_path" >/dev/null 2>&1
                     else
-                        nsenter -t "$container_pid" -m -p touch "$container_path" >/dev/null 2>&1
+                        lxc-attach -n "$vmid" -- touch "$container_path" >/dev/null 2>&1
                     fi
                     
-                    if err_msg="$(nsenter -t "$container_pid" -m -p mount --bind /proc/self/fd/3 "$container_path" 3< "$host_path" 2>&1)"; then
+                    if err_msg="$(lxc-attach -n "$vmid" -- mount --bind /proc/self/fd/3 "$container_path" 3< "$host_path" 2>&1)"; then
                         log_ok "Mount injected successfully."
                         injections_made=true
                     else
-                        log_error "Failed to inject mount via namespace nsenter: ${err_msg}"
+                        log_error "Failed to inject mount via namespace lxc-attach: ${err_msg}"
                         inject_success=false
                     fi
                 else
