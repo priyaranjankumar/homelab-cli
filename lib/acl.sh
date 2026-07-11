@@ -416,11 +416,22 @@ _acl_inspect_data() {
             local injected=true
             local target_dir=""
             if [[ "$is_running" == "true" ]] && [[ "$type" == "submount" || "$type" == "symlink" ]]; then
-                local rootfs="/var/lib/lxc/${vmid}/rootfs"
-                target_dir="${rootfs}${container_path}"
-                target_dir="$(echo "$target_dir" | tr -s '/')"
-                if ! mountpoint -q "$target_dir" 2>/dev/null; then
-                    injected=false
+                local container_pid
+                container_pid="$(lxc-info -n "$vmid" -p -H 2>/dev/null || true)"
+                if [[ -n "$container_pid" && "$container_pid" != "0" && -f "/proc/${container_pid}/mountinfo" ]]; then
+                    if awk -v mp="${container_path}" '$5 == mp {exit 0} END {exit 1}' "/proc/${container_pid}/mountinfo" 2>/dev/null; then
+                        injected=true
+                    else
+                        injected=false
+                    fi
+                else
+                    # Fallback to host mountpoint check if we can't read mountinfo
+                    local rootfs="/var/lib/lxc/${vmid}/rootfs"
+                    target_dir="${rootfs}${container_path}"
+                    target_dir="$(echo "$target_dir" | tr -s '/')"
+                    if ! mountpoint -q "$target_dir" 2>/dev/null; then
+                        injected=false
+                    fi
                 fi
             fi
 
