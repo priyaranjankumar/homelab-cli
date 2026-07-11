@@ -31,6 +31,101 @@ EOF
 
 # ─── Inspect helpers ────────────────────────────────────────────────
 
+_normalize_path() {
+    local path="$1"
+    local IFS='/'
+    local -a parts
+    read -ra parts <<< "$path"
+    local -a output=()
+    for part in "${parts[@]}"; do
+        if [[ -z "$part" || "$part" == "." ]]; then
+            continue
+        fi
+        if [[ "$part" == ".." ]]; then
+            if (( ${#output[@]} > 0 )); then
+                unset "output[$(( ${#output[@]} - 1 ))]"
+                output=("${output[@]}")
+            fi
+        else
+            output+=("$part")
+        fi
+    done
+    echo "/${output[*]}"
+}
+
+_acl_expand_mounts() {
+    local mounts="$1"
+    local -A seen
+    
+    # First pass: mark all explicit parent container paths as seen
+    while IFS='|' read -r host_path container_path; do
+        [[ -z "$host_path" ]] && continue
+        seen["$container_path"]=1
+    done <<< "$mounts"
+    
+    # Second pass: output parents, and find sub-mounts / symlinks
+    while IFS='|' read -r host_path container_path; do
+        [[ -z "$host_path" ]] && continue
+        echo "${host_path}|${container_path}|parent|"
+        
+        if [[ -d "$host_path" ]]; then
+            # 1. Sub-mounts
+            local submounts
+            submounts="$(findmnt -n -r -o TARGET -R "$host_path" 2>/dev/null | tail -n +2 || true)"
+            while IFS= read -r sm; do
+                [[ -z "$sm" ]] && continue
+                [[ "$sm" == "$host_path" ]] && continue
+                local rel_path="${sm#$host_path/}"
+                local container_sm="${container_path}/${rel_path}"
+                container_sm="$(echo "$container_sm" | tr -s '/')"
+                
+                # Only output if not explicitly mounted in config
+                if [[ -z "${seen["$container_sm"]:-}" ]]; then
+                    echo "${sm}|${container_sm}|submount|"
+                    seen["$container_sm"]=1
+                fi
+            done <<< "$submounts"
+            
+            # 2. Symlinks
+            local symlinks
+            symlinks="$(find "$host_path" -type l 2>/dev/null || true)"
+            while IFS= read -r sl; do
+                [[ -z "$sl" ]] && continue
+                local target_text
+                target_text="$(readlink "$sl")"
+                local resolved_host
+                resolved_host="$(readlink -f "$sl")"
+                
+                [[ -z "$resolved_host" ]] && continue
+                [[ ! -e "$resolved_host" ]] && continue
+                
+                local norm_resolved
+                norm_resolved="$(_normalize_path "$resolved_host")"
+                local norm_host_path
+                norm_host_path="$(_normalize_path "$host_path")"
+                
+                if [[ "$norm_resolved" != "$norm_host_path"/* && "$norm_resolved" != "$norm_host_path" ]]; then
+                    local container_target=""
+                    if [[ "$target_text" == /* ]]; then
+                        container_target="$target_text"
+                    else
+                        local sl_dir_host="$(dirname "$sl")"
+                        local rel_sl_dir="${sl_dir_host#$host_path}"
+                        local container_sl_dir="${container_path}/${rel_sl_dir}"
+                        container_target="${container_sl_dir}/${target_text}"
+                        container_target="$(_normalize_path "$container_target")"
+                    fi
+                    
+                    if [[ -z "${seen["$container_target"]:-}" ]]; then
+                        echo "${norm_resolved}|${container_target}|symlink|${sl}"
+                        seen["$container_target"]=1
+                    fi
+                fi
+            done <<< "$symlinks"
+        fi
+    done <<< "$mounts"
+}
+
 # _acl_get_config <vmid>
 #   Retrieve the pct config for a container, or fail.
 _acl_get_config() {
@@ -237,6 +332,8 @@ _acl_inspect_data() {
 
     require_cmd pct "Proxmox container toolkit"
     require_cmd getfacl "ACL inspection tool"
+    require_cmd findmnt "Findmnt tool"
+    require_cmd mountpoint "Mountpoint tool"
 
     local config
     config="$(_acl_get_config "$vmid")"
@@ -245,9 +342,9 @@ _acl_inspect_data() {
     hostname="$(_acl_get_hostname "$config")"
 
     # Check bind mounts
-    local mounts
-    mounts="$(_acl_parse_bind_mounts "$config")"
-    if [[ -z "$mounts" ]]; then
+    local mounts_raw
+    mounts_raw="$(_acl_parse_bind_mounts "$config")"
+    if [[ -z "$mounts_raw" ]]; then
         if [[ "${HOMELAB_JSON}" == "true" ]]; then
             json_start
             json_add_string "vmid" "$vmid"
@@ -263,6 +360,9 @@ _acl_inspect_data() {
         return 0
     fi
 
+    local mounts
+    mounts="$(_acl_expand_mounts "$mounts_raw")"
+
     # Determine UID mapping
     local is_unprivileged=false
     local uid_offset=0
@@ -275,12 +375,18 @@ _acl_inspect_data() {
     local service_users_list
     service_users_list="$(_acl_detect_service_users "$vmid" "$config")"
 
+    local is_running=false
+    if pct status "$vmid" 2>/dev/null | grep -q "running"; then
+        is_running=true
+    fi
+
     _ACL_RESULTS=()
 
     # JSON array accumulator
     local json_items=""
 
-    while IFS='|' read -r host_path container_path; do
+    while IFS='|' read -r host_path container_path type extra_info; do
+        [[ -z "$host_path" ]] && continue
         local owner
         owner="$(_acl_get_owner "$host_path")"
 
@@ -291,22 +397,39 @@ _acl_inspect_data() {
             local access
             access="$(_acl_check_access "$host_path" "$mapped_uid")"
 
+            # Check if injected (only for submount and symlink)
+            local injected=true
+            local target_dir=""
+            if [[ "$is_running" == "true" ]] && [[ "$type" == "submount" || "$type" == "symlink" ]]; then
+                local rootfs="/var/lib/lxc/${vmid}/rootfs"
+                target_dir="${rootfs}${container_path}"
+                target_dir="$(echo "$target_dir" | tr -s '/')"
+                if ! mountpoint -q "$target_dir" 2>/dev/null; then
+                    injected=false
+                fi
+            fi
+
             # Determine recommendation
             local recommendation="OK"
             if [[ "$access" == "path_missing" ]]; then
                 recommendation="Path does not exist on host"
                 access="N/A"
+            elif [[ "$injected" == "false" ]]; then
+                if [[ "$access" == "None" ]]; then
+                    recommendation="Inject mount & Grant RWX"
+                elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null || [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
+                    recommendation="Inject mount & Grant RWX"
+                else
+                    recommendation="Inject mount"
+                fi
             elif [[ "$access" == "None" ]]; then
                 recommendation="Grant RWX"
-            elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null; then
-                # Has some access but may be insufficient — check for at least rw
-                if [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
-                    recommendation="Grant RWX (insufficient)"
-                fi
+            elif ! echo "$access" | grep -qP '^r..[xX]?$' 2>/dev/null || [[ "$access" != *r* ]] || [[ "$access" != *w* ]]; then
+                recommendation="Grant RWX (insufficient)"
             fi
 
             # Store result for grant reuse
-            _ACL_RESULTS+=("${host_path}|${container_path}|${owner}|${service_user}|${service_uid}|${mapped_uid}|${access}|${recommendation}")
+            _ACL_RESULTS+=("${host_path}|${container_path}|${owner}|${service_user}|${service_uid}|${mapped_uid}|${access}|${recommendation}|${type}|${extra_info}")
 
             if [[ "${HOMELAB_JSON}" == "true" ]]; then
                 # Build JSON item
@@ -324,6 +447,8 @@ _acl_inspect_data() {
                 json_add_number "uid_offset" "$uid_offset"
                 json_add_string "current_access" "$access"
                 json_add_string "recommendation" "$recommendation"
+                json_add_string "type" "$type"
+                json_add_string "extra_info" "$extra_info"
                 item_buf="$(_JSON_BUF="$_JSON_BUF" json_end)"
                 _JSON_BUF="$_OUTER_JSON_BUF"
                 _JSON_FIRST="$_OUTER_JSON_FIRST"
@@ -336,7 +461,15 @@ _acl_inspect_data() {
                 print_separator
                 printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Container:" "$vmid"
                 printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Hostname:" "$hostname"
-                printf "  ${C_BOLD}%-20s${C_RESET} %s → %s\n" "Bind Mount:" "$host_path" "$container_path"
+                
+                if [[ "$type" == "submount" ]]; then
+                    printf "  ${C_BOLD}%-20s${C_RESET} %s → %s (${C_YELLOW}Sub-mount${C_RESET})\n" "Bind Mount:" "$host_path" "$container_path"
+                elif [[ "$type" == "symlink" ]]; then
+                    printf "  ${C_BOLD}%-20s${C_RESET} %s → %s (${C_YELLOW}Symlink target of %s${C_RESET})\n" "Bind Mount:" "$host_path" "$container_path" "$extra_info"
+                else
+                    printf "  ${C_BOLD}%-20s${C_RESET} %s → %s\n" "Bind Mount:" "$host_path" "$container_path"
+                fi
+                
                 printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Filesystem Owner:" "$owner"
                 printf "  ${C_BOLD}%-20s${C_RESET} %s (UID %s)\n" "Service User:" "$service_user" "$service_uid"
                 printf "  ${C_BOLD}%-20s${C_RESET} %s\n" "Mapped Host UID:" "$mapped_uid"
@@ -413,7 +546,8 @@ _acl_grant() {
     local json_grant_items=""
 
     for result in "${_ACL_RESULTS[@]}"; do
-        IFS='|' read -r host_path container_path owner service_user service_uid mapped_uid access recommendation <<< "$result"
+        local host_path container_path owner service_user service_uid mapped_uid access recommendation type extra_info
+        IFS='|' read -r host_path container_path owner service_user service_uid mapped_uid access recommendation type extra_info <<< "$result"
 
         # Skip if no changes needed
         if [[ "$recommendation" == "OK" ]]; then
@@ -428,27 +562,70 @@ _acl_grant() {
 
         changes_needed=true
 
+        local needs_inject=false
+        local needs_acl=false
+        if [[ "$recommendation" == *"Inject mount"* ]]; then
+            needs_inject=true
+        fi
+        if [[ "$recommendation" == *"Grant RWX"* ]]; then
+            needs_acl=true
+        fi
+
+        local target_dir=""
+        if [[ "$needs_inject" == "true" ]]; then
+            local rootfs="/var/lib/lxc/${vmid}/rootfs"
+            target_dir="${rootfs}${container_path}"
+            target_dir="$(echo "$target_dir" | tr -s '/')"
+        fi
+
+        local cmd_mount="mount --bind ${host_path} ${target_dir}"
         local cmd_acl_set="setfacl -R -m u:${mapped_uid}:rwX ${host_path}"
         local cmd_acl_default="setfacl -R -d -m u:${mapped_uid}:rwX ${host_path}"
 
         if [[ "${HOMELAB_JSON}" != "true" ]]; then
             echo ""
-            print_section "Bind Mount: ${host_path} → ${container_path}"
-            log_info "Mapped UID ${mapped_uid} (${service_user}) needs access to ${host_path}"
-            echo "  ${C_DIM}Command:${C_RESET} ${cmd_acl_set}"
-            echo "  ${C_DIM}Command:${C_RESET} ${cmd_acl_default}"
+            if [[ "$type" == "submount" ]]; then
+                print_section "Sub-mount Injection: ${host_path} → ${container_path}"
+            elif [[ "$type" == "symlink" ]]; then
+                print_section "Symlink Injection: ${host_path} (target of ${extra_info}) → ${container_path}"
+            else
+                print_section "Bind Mount: ${host_path} → ${container_path}"
+            fi
+
+            if [[ "$needs_inject" == "true" ]]; then
+                log_info "Needs to be injected into running container namespace"
+                echo "  ${C_DIM}Command:${C_RESET} mkdir -p ${target_dir}"
+                echo "  ${C_DIM}Command:${C_RESET} ${cmd_mount}"
+            fi
+            if [[ "$needs_acl" == "true" ]]; then
+                log_info "Mapped UID ${mapped_uid} (${service_user}) needs access to ${host_path}"
+                echo "  ${C_DIM}Command:${C_RESET} ${cmd_acl_set}"
+                echo "  ${C_DIM}Command:${C_RESET} ${cmd_acl_default}"
+            fi
         fi
 
         # Dry-run check
-        if dry_run_guard "$cmd_acl_set"; then
-            dry_run_guard "$cmd_acl_default" || true
+        if [[ "${HOMELAB_DRY_RUN}" == "true" ]]; then
+            if [[ "$needs_inject" == "true" ]]; then
+                dry_run_guard "mkdir -p ${target_dir}"
+                dry_run_guard "${cmd_mount}"
+            fi
+            if [[ "$needs_acl" == "true" ]]; then
+                dry_run_guard "${cmd_acl_set}"
+                dry_run_guard "${cmd_acl_default}"
+            fi
+
             if [[ "${HOMELAB_JSON}" == "true" ]]; then
                 local item
                 item="$(json_object \
                     "host_path" "$host_path" \
                     "container_path" "$container_path" \
                     "mapped_uid" "$mapped_uid" \
+                    "type" "$type" \
                     "action" "dry_run" \
+                    "needs_inject" "$needs_inject" \
+                    "needs_acl" "$needs_acl" \
+                    "command_mount" "$cmd_mount" \
                     "command_acl" "$cmd_acl_set" \
                     "command_default" "$cmd_acl_default")"
                 if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
@@ -458,7 +635,14 @@ _acl_grant() {
         fi
 
         # Confirm with user
-        if ! confirm "Apply ACLs for UID ${mapped_uid} on ${host_path}?"; then
+        local confirm_msg="Apply changes for ${host_path}?"
+        if [[ "$needs_inject" == "true" && "$needs_acl" == "true" ]]; then
+            confirm_msg="Inject mount and apply ACLs on ${host_path}?"
+        elif [[ "$needs_inject" == "true" ]]; then
+            confirm_msg="Inject mount from ${host_path} into container?"
+        fi
+
+        if ! confirm "$confirm_msg"; then
             log_warn "Skipped ${host_path}."
             if [[ "${HOMELAB_JSON}" == "true" ]]; then
                 local item
@@ -473,46 +657,68 @@ _acl_grant() {
             continue
         fi
 
-        # Apply ACLs
-        log_info "Applying ACLs on ${host_path}..."
-        if $cmd_acl_set && $cmd_acl_default; then
-            # Verify
-            local new_access
-            new_access="$(_acl_check_access "$host_path" "$mapped_uid")"
-            if [[ "$new_access" != "None" && "$new_access" != "path_missing" ]]; then
-                log_ok "ACL applied successfully. New access: ${new_access}"
-                if [[ "${HOMELAB_JSON}" == "true" ]]; then
-                    local item
-                    item="$(json_object \
-                        "host_path" "$host_path" \
-                        "container_path" "$container_path" \
-                        "mapped_uid" "$mapped_uid" \
-                        "action" "applied" \
-                        "new_access" "$new_access")"
-                    if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
-                    json_grant_items+="$item"
+        # Apply changes
+        local inject_success=true
+        if [[ "$needs_inject" == "true" ]]; then
+            log_info "Injecting mount..."
+            local parent_target="$(dirname "$target_dir")"
+            if mkdir -p "$parent_target"; then
+                if [[ -d "$host_path" ]]; then
+                    mkdir -p "$target_dir"
+                else
+                    touch "$target_dir"
+                fi
+                if mount --bind "$host_path" "$target_dir"; then
+                    log_ok "Mount injected successfully."
+                else
+                    log_error "Failed to inject mount."
+                    inject_success=false
                 fi
             else
-                log_error "ACL verification failed for ${host_path}."
-                if [[ "${HOMELAB_JSON}" == "true" ]]; then
-                    local item
-                    item="$(json_object \
-                        "host_path" "$host_path" \
-                        "container_path" "$container_path" \
-                        "mapped_uid" "$mapped_uid" \
-                        "action" "verification_failed")"
-                    if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
-                    json_grant_items+="$item"
-                fi
+                log_error "Failed to create target parent directory."
+                inject_success=false
             fi
-        else
-            log_error "Failed to apply ACLs on ${host_path}."
+        fi
+
+        local acl_success=true
+        if [[ "$needs_acl" == "true" && "$inject_success" == "true" ]]; then
+            log_info "Applying ACLs on ${host_path}..."
+            if eval "$cmd_acl_set" && eval "$cmd_acl_default"; then
+                # Verify
+                local new_access
+                new_access="$(_acl_check_access "$host_path" "$mapped_uid")"
+                if [[ "$new_access" != "None" && "$new_access" != "path_missing" ]]; then
+                    log_ok "ACL applied successfully. New access: ${new_access}"
+                else
+                    log_error "ACL verification failed for ${host_path}."
+                    acl_success=false
+                fi
+            else
+                log_error "Failed to apply ACLs on ${host_path}."
+                acl_success=false
+            fi
+        fi
+
+        if [[ "$inject_success" == "true" && "$acl_success" == "true" ]]; then
             if [[ "${HOMELAB_JSON}" == "true" ]]; then
                 local item
                 item="$(json_object \
                     "host_path" "$host_path" \
                     "container_path" "$container_path" \
                     "mapped_uid" "$mapped_uid" \
+                    "type" "$type" \
+                    "action" "applied")"
+                if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
+                json_grant_items+="$item"
+            fi
+        else
+            if [[ "${HOMELAB_JSON}" == "true" ]]; then
+                local item
+                item="$(json_object \
+                    "host_path" "$host_path" \
+                    "container_path" "$container_path" \
+                    "mapped_uid" "$mapped_uid" \
+                    "type" "$type" \
                     "action" "failed")"
                 if [[ -n "$json_grant_items" ]]; then json_grant_items+=","; fi
                 json_grant_items+="$item"
