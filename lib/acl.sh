@@ -71,7 +71,7 @@ _acl_expand_mounts() {
         if [[ -d "$host_path" ]]; then
             # 1. Sub-mounts
             local submounts
-            submounts="$(findmnt -n -r -o TARGET --list 2>/dev/null | awk -v p="${host_path}/" 'index($0, p) == 1' || true)"
+            submounts="$(awk -v p="${host_path}/" 'index($5, p) == 1 {print $5}' /proc/self/mountinfo 2>/dev/null || true)"
             while IFS= read -r sm; do
                 [[ -z "$sm" ]] && continue
                 [[ "$sm" == "$host_path" ]] && continue
